@@ -1,0 +1,22 @@
+name = "ent-relay"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# There is deliberately no account_id here. Deploying needs `wrangler login` first, which makes you
+# pick the account interactively -- the relay can never land in whatever account a machine happens
+# to be logged into.
+
+[vars]
+# How often the relay reads the scouting API. Scouts only upload every 3s, so going much faster
+# buys little. Each read costs one row written (the alarm), and the free plan allows 100,000 a day:
+# 1500ms uses 57,600 of them, leaving room to spare. 1000ms would use 86,400.
+POLL_INTERVAL_MS = "1500"
+
+[[durable_objects.bindings]]
+name = "CALL_RELAY"
+class_name = "CallRelay"
+
+# SQLite-backed Durable Objects are the only kind available on the free plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CallRelay"]

@@ -1,0 +1,15 @@
+{
+  "name": "ent-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Push relay between Ent Pathfinder clients and the community scouting API.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local --port 8787",
+    "test:load": "node test/load-test.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
