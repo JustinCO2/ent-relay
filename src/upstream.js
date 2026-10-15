@@ -1,46 +1,43 @@
+/** Reading ent calls from the scouting API. The single relay object is the only caller. */
+
+/** The only event the plugin follows, and so the only one read. */
+const EVENT_TYPE = "ENT";
+
 /**
- * Reading the community scouting API.
- *
- * This is the only code in the relay that talks to the API, and the single relay object is its only
- * caller, so the API sees one reader no matter how many players are connected.
+ * Two ent lifetimes, as long as the plugin keeps an ent: a client connecting mid-event then gets
+ * every earlier report of each running ent, so a late report joins its ent instead of looking new.
  */
+const WINDOW_SECONDS = 240;
 
-export const UPSTREAM_URL =
-  "https://g98c6e9efd32fb1-scouting.adb.us-ashburn-1.oraclecloudapps.com/ords/scouting/calls/";
-
-/** How far back to ask for calls. Matches the widest window the plugin tracks anything for. */
-const WINDOW_SECONDS = 330;
-
-/** The window rarely holds more than a few dozen calls. This is a ceiling, not a page size. */
+/** The window rarely holds more than a few dozen calls. A ceiling, not a page size. */
 const ROW_LIMIT = 500;
 
 const TIMEOUT_MS = 5000;
 
+/** A failure described by the relay itself, so its message is safe to show publicly. */
+export class UpstreamError extends Error {}
+
 /**
- * Fetch every call from the last WINDOW_SECONDS, converted to the shape clients receive.
- * Throws on any failure; the caller decides what a failed read means.
+ * Every ent call from the last WINDOW_SECONDS, in the shape clients receive. The query asks for
+ * ents only, and the rows are filtered again in case an endpoint ignores that.
  */
 export async function readRecentCalls(upstreamUrl, nowSeconds) {
   const response = await fetchWithTimeout(buildUrl(upstreamUrl, nowSeconds), {
     headers: { "User-Agent": "ent-relay (Ent Pathfinder RuneLite plugin)" },
   });
   if (!response.ok) {
-    throw new Error(`Scouting API returned HTTP ${response.status}`);
+    throw new UpstreamError(`Scouting API returned HTTP ${response.status}`);
   }
 
   const body = await response.json();
   const rows = Array.isArray(body.items) ? body.items : [];
-  return rows.map(toCall);
+  return rows.filter((row) => row.event_type === EVENT_TYPE).map(toCall);
 }
 
 /**
- * fetch() with a timeout whose timer is cleared the moment the request settles.
- *
- * AbortSignal.timeout() looks equivalent but leaves its timer pending after a fast response, and a
- * Durable Object with a pending timer is never idle: it cannot hibernate and is billed for duration
- * the entire time. On the deployed relay it held every 0.1s read open for the full 1.6s between
- * reads, awake around the clock (~11,000 GB-s/day). Clearing the timer cut each read to ~0.13s
- * (~900 GB-s/day), measured after deploying.
+ * fetch() with a timeout that is cleared the moment the request settles. AbortSignal.timeout()
+ * leaves its timer pending after a fast response, and a Durable Object with a pending timer never
+ * sleeps, so it would be billed awake around the clock.
  */
 async function fetchWithTimeout(url, init) {
   const controller = new AbortController();
@@ -54,17 +51,15 @@ async function fetchWithTimeout(url, init) {
 
 function buildUrl(upstreamUrl, nowSeconds) {
   const url = new URL(upstreamUrl);
-  url.searchParams.set("q", JSON.stringify({ discovered_time: { $gt: nowSeconds - WINDOW_SECONDS } }));
+  url.searchParams.set("q", JSON.stringify({
+    event_type: EVENT_TYPE,
+    discovered_time: { $gt: nowSeconds - WINDOW_SECONDS },
+  }));
   url.searchParams.set("limit", String(ROW_LIMIT));
   return url;
 }
 
-/**
- * Keep only what the plugin uses: what the event is, where, and when.
- *
- * The API also returns the name of the scout who reported each sighting. Nothing in the plugin needs
- * it, so it is dropped here, on arrival -- never stored, never transformed, never sent to anyone.
- */
+/** What the event is, where, and when. Nothing about who reported it is kept or forwarded. */
 function toCall(row) {
   return {
     event_type: row.event_type,

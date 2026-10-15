@@ -1,13 +1,6 @@
 /**
- * Load test for the relay. Run it against the local dev server:
- *
- *   npm run dev          (one terminal)
- *   npm run test:load    (another)
- *
- * It checks the property the relay exists for: the scouting API is read at the same rate whether
- * ten players are connected or hundreds. It also checks that every client hears pushes, that
- * subscription filters hold, that keep-alive pings are answered, and that polling stops once
- * nobody is connected.
+ * Load test for a local relay: `npm run dev` in one terminal, `npm run test:load` in another.
+ * See the README for what it checks.
  *
  * Environment overrides: RELAY_URL, CLIENTS (default 300), PHASE_SECONDS (default 20).
  */
@@ -22,8 +15,8 @@ const IDLE_CHECK_SECONDS = 5;
 /** Comfortably longer than the relay's poll interval. */
 const SETTLE_MS = 3000;
 
-/** Half the clients ask for ents on the forestry world, like the plugin; half take everything. */
-const FILTERED_QUERY = "?type=ENT&world=444";
+/** Half the clients ask for the forestry world, like the plugin; half take every world. */
+const FILTERED_QUERY = "?world=444";
 
 const failures = [];
 
@@ -68,7 +61,7 @@ async function runPhase(count) {
   const filterViolations = clients.reduce((sum, client) => sum + client.filterViolations, 0);
 
   check(silentClients === 0, `all ${count} clients received at least one push (${silentClients} did not)`);
-  check(filterViolations === 0, `filtered clients only received ENT calls on world 444 (${filterViolations} stray)`);
+  check(filterViolations === 0, `clients only received ents, and filtered ones only on world 444 (${filterViolations} stray)`);
   check(pingAnswered, "a keep-alive ping was answered with pong");
 
   return {
@@ -105,16 +98,14 @@ function connectClient(filtered) {
     }
     const message = JSON.parse(event.data);
     client.messages++;
-    if (filtered) {
-      client.filterViolations += message.calls.filter(isOutsideFilter).length;
-    }
+    client.filterViolations += message.calls.filter((call) => isStray(call, filtered)).length;
   });
 
   return client;
 }
 
-function isOutsideFilter(call) {
-  return call.event_type !== "ENT" || call.world !== 444;
+function isStray(call, filtered) {
+  return call.event_type !== "ENT" || (filtered && call.world !== 444);
 }
 
 function pingAnswers(client) {
@@ -143,10 +134,7 @@ async function readsWhileIdle() {
   return after.upstreamReads - before.upstreamReads;
 }
 
-/**
- * The relay's whole point: going from a handful of clients to hundreds must not change how often
- * the scouting API is read. Allows a little slack for timing at the edges of each phase.
- */
+/** Hundreds of clients must not read the API more often than a handful, give or take timing. */
 function checkUpstreamLoadIsFlat(small, large) {
   const tolerance = 1.25;
   check(

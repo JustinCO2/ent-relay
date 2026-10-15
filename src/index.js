@@ -2,16 +2,10 @@ import { CallRelay } from "./relay.js";
 
 export { CallRelay };
 
-/**
- * Every connection is routed to the same single relay object. That is what guarantees the scouting
- * API has exactly one reader, however many players are connected.
- */
+/** Every connection goes to this one relay object, so the scouting API has a single reader. */
 const RELAY_NAME = "global";
 
-/**
- * Run the relay object near the scouting API, which is hosted in Oracle's us-ashburn region.
- * Players connect to it from anywhere; the hop that happens every second is the one kept short.
- */
+/** Keep the object near the scouting API: the read every 1.5s is the hop worth keeping short. */
 const RELAY_LOCATION = "enam";
 
 const ROUTES = new Set(["/ws", "/health"]);
@@ -23,8 +17,7 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    // Refuse anything that is not a real connection attempt here, before it reaches the relay
-    // object. Junk traffic then costs one request rather than two.
+    // Turn junk away here, so it costs one request rather than also waking the relay object.
     if (url.pathname === "/ws" && request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected a WebSocket upgrade", { status: 426 });
     }

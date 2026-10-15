@@ -1,14 +1,9 @@
 # Ent Relay
 
-A push relay between [Ent Pathfinder](https://github.com/JustinCO2/ent-pathfinder) players and the community scouting API, run on Cloudflare
-Workers. Players connect once and are sent new calls as they happen; the scouting API is read by
-the relay alone, **once every 1.5 seconds, however many players are connected**.
-
-## Why it exists
-
-Without it, every installed copy of the plugin polls the scouting API directly, so load on a
-community-run database grows with every install — hundreds of always-on players would be hundreds
-of requests every few seconds. The relay turns that into one reader:
+A push relay between [Ent Pathfinder](https://github.com/JustinCO2/ent-pathfinder) players and the
+community scouting API, run on Cloudflare Workers. Players connect once and are sent ent calls as
+they happen, while the scouting API is read by the relay alone: **once every 1.5 seconds, however
+many players are connected**.
 
 ```
  scouting API  <── one read every 1.5s ──  relay (one Durable Object)  ── push ──>  every player
@@ -24,27 +19,26 @@ Measured locally with `npm run test:load`, at a 1s poll interval:
 
 ## How it works
 
-- **One relay object.** Every connection is routed to a single Durable Object, which is what
-  guarantees a single reader. It is placed in eastern North America, next to the API.
-- **Alarm-driven reads.** While anyone is connected, an alarm reads the API every
-  `POLL_INTERVAL_MS` (1500, set in wrangler.toml). When the last player disconnects, the alarm is not
-  rescheduled and polling stops.
-- **Push on change only.** A read identical to the last one sends nothing.
-- **Full snapshots, not diffs.** Each message holds every current call matching the player's
-  subscription, so a dropped message or a reconnect can never leave a player out of step.
-- **Hibernation.** Between reads the object can be evicted from memory with every connection
-  left open, and idle time is not billed. Keep-alive pings are answered without waking it.
-- **Only what the plugin uses.** Each call carries what the event is, where, and when. The API
-  also returns the name of the scout who reported it; the relay drops that on arrival, so it is
-  never stored or sent to anyone.
+- **One relay object.** Every connection goes to a single Durable Object, so the API has exactly
+  one reader. It runs in eastern North America, near the API.
+- **Reads only while someone listens.** An alarm reads the API every `POLL_INTERVAL_MS` (set in
+  `wrangler.toml`) while anyone is connected, and stops when the last player leaves.
+- **Push on change, as full snapshots.** A read identical to the last one sends nothing. Each message
+  holds every current call for that player, so a missed message or a reconnect never leaves them
+  out of step.
+- **Hibernation.** Between reads the object can sleep with every connection left open, and idle
+  time is not billed. Keep-alive pings are answered without waking it.
+- **Ents only, and nothing about scouts.** The relay asks the API for ents only and filters again
+  on arrival. Each call carries what the event is, where and when; nothing about who reported it
+  is kept or forwarded.
 
 ## Protocol
 
-Connect to `wss://<relay>/ws`, optionally filtered:
+Connect to `wss://<relay>/ws`, optionally filtered by world:
 
 ```
-/ws?type=ENT&world=444     ents on world 444 only
-/ws                        everything (type=ANY is the same)
+/ws?world=444     ents on world 444
+/ws               ents on every world
 ```
 
 Every message is a full snapshot:
@@ -62,12 +56,18 @@ Every message is a full snapshot:
 
 Send the text `ping` to keep a quiet connection alive; the reply is `pong`.
 
-`GET /health` reports connection count and read counters. The counters reset whenever the object
-hibernates.
+`GET /health` reports connections and read counters, which reset whenever the object sleeps. It is
+public, so a failed read shows only the relay's own message (an HTTP status, or a missing secret);
+any other error shows just its type, with the details in `wrangler tail`.
 
 ## Running it locally
 
-Needs Node 18 or newer. No Cloudflare account is required — this is Cloudflare's local runtime.
+Needs Node 18 or newer, and no Cloudflare account. The scouting API's read address is not in this
+repository; put it in `.dev.vars`, which is gitignored:
+
+```
+UPSTREAM_URL=https://...
+```
 
 ```
 npm install
@@ -75,65 +75,34 @@ npm run dev          # relay on http://127.0.0.1:8787
 npm run test:load    # in a second terminal
 ```
 
-The load test connects 10 clients and then 300 (half filtered, half not), and checks that every
-client is pushed to, that filters hold, that pings are answered, that the upstream rate does not
-change between the two, and that polling stops once everyone disconnects. `CLIENTS` and
+The load test connects 10 clients and then 300, half of them filtered by world. It checks that every
+client is pushed to, that only ents arrive and filters hold, that pings are answered, that the
+upstream rate stays flat, and that polling stops once everyone leaves. `CLIENTS` and
 `PHASE_SECONDS` override the defaults.
 
 ## Deploying
 
-This should live in a **personal Cloudflare account** created for the purpose. `wrangler.toml`
-deliberately has no `account_id`, so deploying always goes through an interactive login and can
-never land in whichever account a machine happens to be signed into.
+`wrangler.toml` has no `account_id`, so deploying always asks which account to use:
 
 ```
-npx wrangler login    # sign in to the account you created
-npx wrangler whoami   # confirm it is that account before going further
+npx wrangler login
+npx wrangler whoami                    # confirm it is the right account
+npx wrangler secret put UPSTREAM_URL   # paste the read address when prompted
 npm run deploy
 ```
 
-On Windows PowerShell, use `npx.cmd` and `npm.cmd` if script execution is restricted.
+Without the secret the relay still accepts connections, but every read fails and `/health` shows
+`UPSTREAM_URL is not set`. On Windows PowerShell, use `npx.cmd` and `npm.cmd` if script execution is
+restricted.
 
-The relay is then at `https://ent-relay.<your-subdomain>.workers.dev`, with players connecting to
-`wss://ent-relay.<your-subdomain>.workers.dev/ws`.
+## Cost and limits
 
-## Cost
-
-Estimated for **500 players connected around the clock**, against the published free-plan limits:
-
-| Billed as | Use per day | Free limit per day |
-|---|---|---|
-| Requests (one per connection; players send nothing else) | ~12,000, assuming each reconnects hourly | 100,000 |
-| Rows written (one per alarm, every 1.5s) | 57,600 | 100,000 |
-| Duration (awake ~0.13s per read; measured on the deployed relay) | ~910 GB-s | 13,000 GB-s |
-| Outgoing pushes | any | not billed |
-
-That fits the free plan with room to spare. Rows written depends only on the poll interval, not
-on player count. Duration cannot run out at all: one object awake around the clock would use
-~11,000 GB-s.
-
-The free plan never bills. Past a limit, further operations of that kind fail until the daily
-reset at 00:00 UTC, so the worst case is an outage, never a charge. Upgrading to Workers Paid
-($5/month) is the only way to start being charged.
-
-What actually threatens the allowance is not popularity but a misbehaving client reconnecting in
-a loop, which is why the plugin's client is built to prevent it — see *Keeping the relay free to
-run* in the [plugin's README](https://github.com/JustinCO2/ent-pathfinder#keeping-the-relay-free-to-run).
-
-A per-request alternative — the plugin polling a cached endpoint every 3s — would cost roughly
-$28/month at 100 always-on players and $130/month at 500, which is why this is push-based.
-
-## Limits and open questions
-
-- **Connections per object.** Cloudflare documents no hard maximum; its WebSocket guidance
-  describes one object serving "thousands of clients". 300 was tested locally. The plugin only
-  connects while players are on a single forestry world, which holds at most 2,000. If that ever
-  proves too many, connections can be spread over a few objects with only one reading the API.
-- **Single point of failure.** If the relay is down, players receive nothing. The plugin says so
-  on screen and waits, rather than falling back to the scouting API, which would bring back the
-  exact load problem at the worst moment.
-- **Latency floor.** Measured end to end at a 1s poll interval, a call reached players a median of ~2.9s after a scout
-  saw it; 1.5s adds about a quarter-second on average. Most of it is the scouting plugin batching uploads every 3s, which only its author
-  can change; the relay itself adds at most one poll interval.
-- **Open endpoint.** Anyone can connect. Each connection costs one request, so abuse would show up
-  as request volume; Cloudflare rate limiting can be added if it ever does.
+- **Fits the free plan.** Reads are fixed at one per 1.5 seconds whatever the player count, an idle
+  relay is not billed, and pushes are free. That is why the relay pushes rather than having every
+  player poll.
+- **Connections per object.** Cloudflare documents no hard maximum for one object. 300 were tested
+  locally, and the plugin only connects from world 444, which holds at most 2,000 players.
+- **Single point of failure.** If the relay is down, players receive nothing. The plugin waits rather
+  than falling back to polling the API, which would bring back the load problem.
+- **Latency.** A call reaches players a median of about 3 seconds after a scout sees it, most of it
+  the scouting plugin's own 3-second upload batching.

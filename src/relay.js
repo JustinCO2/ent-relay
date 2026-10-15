@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { readRecentCalls, UPSTREAM_URL } from "./upstream.js";
+import { readRecentCalls, UpstreamError } from "./upstream.js";
 import { callsFor, parseSubscription } from "./subscription.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;
@@ -16,24 +16,19 @@ const MAX_DOUBLINGS = 6;
 const FAILURES_KEY = "consecutiveFailures";
 
 /**
- * The one place the scouting API is read from.
+ * The one place the scouting API is read from. While any player is connected, an alarm reads it
+ * every POLL_INTERVAL_MS and pushes changes out; with nobody connected, polling stops.
  *
- * Every connected player holds a WebSocket to this single object. While at least one is connected,
- * an alarm reads the API every POLL_INTERVAL_MS and pushes any change out. With nobody connected,
- * polling stops entirely.
- *
- * Connections use the WebSocket Hibernation API: between reads the object can be evicted from
- * memory with every connection still open, and nothing is billed for that idle time. Anything kept
- * in memory can therefore disappear between alarms -- the fields below are written with that in mind.
+ * Connections use WebSocket hibernation, so the object can be evicted between reads with every
+ * connection still open. Anything held in memory can vanish between alarms.
  */
 export class CallRelay extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
 
     /**
-     * The most recent read. Used to greet new connections and to skip pushing a snapshot that has
-     * not changed. Lost whenever the object hibernates, which costs at most one repeated push --
-     * clients already ignore reports they have seen.
+     * The most recent read: greets new connections, and skips pushing an unchanged snapshot. Lost
+     * when the object sleeps, which costs at most one repeated push.
      */
     this.latestCalls = null;
     this.latestSnapshotKey = null;
@@ -41,7 +36,7 @@ export class CallRelay extends DurableObject {
     /** Reads failed in a row. Null until loaded from storage; see loadFailureCount(). */
     this.consecutiveFailures = null;
 
-    /** Counters for /health. Like everything in memory, they reset when the object hibernates. */
+    /** Counters for /health; they reset when the object sleeps. */
     this.stats = {
       upstreamReads: 0,
       upstreamFailures: 0,
@@ -92,7 +87,8 @@ export class CallRelay extends DurableObject {
       await this.recordSuccess();
     } catch (error) {
       this.stats.upstreamFailures++;
-      this.stats.lastError = String(error);
+      this.stats.lastError = publicMessage(error);
+      console.error("Scouting API read failed:", error);
       await this.recordFailure();
     } finally {
       await this.ctx.storage.setAlarm(Date.now() + this.nextReadDelayMs());
@@ -100,9 +96,8 @@ export class CallRelay extends DurableObject {
   }
 
   /**
-   * Normally the poll interval. While the scouting API is failing, each further failure doubles the
-   * wait, up to a minute, rather than keep hitting a server that may be struggling -- possibly
-   * because it is overloaded. The first successful read returns to full speed.
+   * The poll interval, doubling with each consecutive failure up to a minute, so a struggling API
+   * is not hammered. The first successful read returns to full speed.
    */
   nextReadDelayMs() {
     const interval = this.pollIntervalMs();
@@ -111,9 +106,8 @@ export class CallRelay extends DurableObject {
   }
 
   /**
-   * The failure count lives in storage, not just memory: the relay sleeps between reads and can be
-   * evicted, and an in-memory count would reset to zero each time, so the backoff would never grow.
-   * It is written only when it changes -- on a failure, and on recovery -- never on a normal read.
+   * Kept in storage, because an in-memory count would reset every time the object sleeps and the
+   * backoff would never grow. Written only on a failure or a recovery, never on a normal read.
    */
   async loadFailureCount() {
     if (this.consecutiveFailures === null) {
@@ -156,10 +150,7 @@ export class CallRelay extends DurableObject {
     this.stats.broadcasts++;
   }
 
-  /**
-   * Send a client every current call matching its subscription. Each message is a full snapshot
-   * rather than a diff, so a client that missed a message, or reconnected, is never out of step.
-   */
+  /** Send a client every current call matching its subscription, as a full snapshot. */
   sendCalls(socket, calls) {
     const subscription = socket.deserializeAttachment();
     const message = {
@@ -195,11 +186,14 @@ export class CallRelay extends DurableObject {
   }
 
   /**
-   * The scouting API, unless overridden. The override exists for testing -- pointing a local relay
-   * at a deliberately broken address is how the failure backoff is exercised.
+   * The scouting API's read address, kept out of source: set with `wrangler secret put UPSTREAM_URL`,
+   * or in .dev.vars for `npm run dev`.
    */
   upstreamUrl() {
-    return this.env.UPSTREAM_URL || UPSTREAM_URL;
+    if (!this.env.UPSTREAM_URL) {
+      throw new UpstreamError("UPSTREAM_URL is not set");
+    }
+    return this.env.UPSTREAM_URL;
   }
 
   pollIntervalMs() {
@@ -221,6 +215,14 @@ export class CallRelay extends DurableObject {
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * What the public /health page may say about a failed read. A runtime error can quote the secret
+ * address it failed to fetch, so only the relay's own messages are shown in full.
+ */
+function publicMessage(error) {
+  return error instanceof UpstreamError ? error.message : `${error?.name ?? "Error"} (see wrangler tail)`;
 }
 
 /** Finish a close handshake, ignoring a socket that is already gone. */
